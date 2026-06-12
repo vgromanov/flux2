@@ -81,9 +81,11 @@ any number of `Kustomizations` across sources and tenants.
 - Deduplicate transformer sets across overlays, repositories and source artifacts.
 - Expose the full expressiveness of Kustomize transformer specs (custom
   `fieldSpecs`) without growing the `Kustomization` API field by field.
-- Preserve Kustomize semantics: applying the resolved transformers must be
-  equivalent in behavior to the `transformers:` directive in a
-  `kustomization.yaml`.
+- Preserve Kustomize transformer semantics: the resolved transformers must behave
+  as a `transformers:` directive applied to the **final build output**, including
+  support for custom `fieldSpecs`. This is a second Kustomize pass over the built
+  output rather than an inlining into the source `kustomization.yaml`; the
+  distinction and its consequences are documented in Build pipeline and Drawbacks.
 
 ### Non-Goals
 
@@ -143,7 +145,12 @@ On each reconciliation, `kustomize-controller`:
 1. resolves `spec.sourceRef` and fetches the source artifact;
 2. loads the manifests at `spec.path` — either plain transformer YAML files, or a
    Kustomize root that is built first (allowing transformer sets that are
-   themselves composed with Kustomize);
+   themselves composed with Kustomize). When the path is built as a Kustomize
+   root, the materialization build runs with the resource factory's
+   `IncludeLocalConfigs` option enabled so that bundled `local-config` companion
+   resources (replacement sources) survive materialization instead of being
+   pruned by the default local-config handling; there is no `kustomize build` CLI
+   flag for this, so `kustomize-controller` sets the krusty API option directly;
 3. validates that the result contains only Kustomize transformer resources, and
    only kinds permitted by `spec.allowedKinds`;
 4. records the validated revision and the inventory of transformer objects in the
@@ -219,8 +226,18 @@ source artifact @ revision
 This is implemented as a second Kustomize pass with a synthetic
 `kustomization.yaml` that lists the build output (plus any `local-config`
 companion resources shipped with the transformer sets) under `resources:` and the
-resolved transformer manifests under `transformers:`, preserving exact Kustomize
-semantics including custom `fieldSpecs`.
+resolved transformer manifests under `transformers:`, preserving Kustomize
+transformer semantics including custom `fieldSpecs`.
+
+Because this is a distinct second pass, the resolved transformers operate on the
+fully built output of `spec.path` — after generators, name-hash finalization,
+namespacing and the consumer's own transformers (`spec.components`,
+`spec.patches`, `spec.images`, `spec.commonMetadata`) have already been applied.
+This is the intended behavior ("apply this transformer set to the final build
+output"), but it is deliberately **not** a 1:1 substitute for inlining the same
+transformers under `transformers:` in the source `kustomization.yaml`, where they
+would run before name-hash finalization and could interleave with the other
+transformers. See Drawbacks.
 
 Whenever a consumed `Transformer` changes (new validated revision), all
 `Kustomizations` referencing it are requeued, mirroring the existing
@@ -706,6 +723,16 @@ The feature will be gated behind a `Transformers` feature gate on
 - Additional watches and fan-out (one `Transformer` to many `Kustomizations`)
   increase controller load; the implementation reuses the existing source
   index/requeue machinery.
+- Transformer application is a second Kustomize pass over the built output, not an
+  inlining into the source `kustomization.yaml`. Resolved transformers always run
+  after generators, name-hash finalization, namespacing and the consumer's own
+  transformers, and cannot be interleaved with them. For the overwhelming majority
+  of transformer kinds and `fieldSpecs` this is behaviorally indistinguishable, but
+  it is not a byte-for-byte 1:1 mapping to listing the same transformers under
+  `transformers:` in the original kustomization: the model optimizes for "apply
+  this set to the final build output" rather than full single-pass pipeline
+  equivalence. Cases that depend on running before name-hash finalization or on a
+  specific interleaving with other transformers are the known divergence.
 
 ## Implementation History
 
