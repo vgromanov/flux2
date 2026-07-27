@@ -4,7 +4,7 @@
 
 **Creation date:** 2026-06-11
 
-**Last update:** 2026-06-11
+**Last update:** 2026-07-27
 
 ## Summary
 
@@ -22,10 +22,17 @@ to the cluster directly.
 
 ## Motivation
 
-Kustomize transformers in their full specification form are significantly more
-expressive than the convenience fields exposed by `kustomization.yaml` and by the
-Flux `Kustomization` API (`spec.patches`, `spec.images`, `spec.commonMetadata`).
-A full transformer spec supports custom `fieldSpecs`, which enables use cases such as:
+Full-spec Kustomize transformers already work inside a single Flux `Kustomization`
+today: any `PrefixSuffixTransformer`, `ImageTagTransformer`,
+`ReplacementTransformer` or `LabelTransformer` can be listed under `transformers:`
+in the built `kustomization.yaml`, or carried in a `spec.components` entry. This
+RFC does not add a missing capability — it addresses **reuse**.
+
+The reason fleets reach for these transformers is that in their full specification
+form they are significantly more expressive than the convenience fields exposed by
+the Flux `Kustomization` API (`spec.patches`, `spec.images`,
+`spec.commonMetadata`). A full transformer spec supports custom `fieldSpecs`,
+which enables use cases such as:
 
 - applying a name prefix or suffix only to a limited set of resource kinds and
   reference fields, instead of every name field in the build;
@@ -41,8 +48,10 @@ A full transformer spec supports custom `fieldSpecs`, which enables use cases su
   wildcard `fieldPaths` (e.g. `spec.template.spec.containers.*.securityContext`),
   something neither JSON6902 nor strategic-merge patches can express.
 
-Today, Flux users who need this level of control have two options, both with
-significant drawbacks:
+The capability, then, is not the gap. The gap is defining such a transformer set
+once and consuming it from many `Kustomizations` across sources and tenants
+without copying files. Today, Flux users who need to share a transformer set this
+way have two options, both with significant drawbacks:
 
 1. **Pure-transformer overlays.** Every application/environment combination gets a
    Kustomize overlay whose only purpose is to attach a set of transformers to a base.
@@ -62,10 +71,11 @@ application manifests delivered via `OCIRepository` and environment configuratio
 via `GitRepository`. Since Kustomize cannot reference files across artifact
 boundaries, the transformer set must be vendored into every source, and keeping the
 copies in sync becomes a manual process. Composing artifacts from several sources
-via a 3rd party `ExternalArtifact` controller can partially mitigate this, but at
-the cost of reduced visibility and added source management complexity — different
-transformer sets have to be mounted at the same path across composed artifacts
-(see Alternatives).
+with an `ArtifactGenerator` can partially mitigate this, but it co-locates files
+in a single artifact tree, which is a different operation than composing
+transformer sets at build time: the composed set is fixed at generation time, and
+independently authored sets whose companion resources share an identity cannot be
+combined at all (see Alternatives).
 
 A dedicated `Transformer` API lets transformer sets be sourced, versioned and
 selected like applications: defined once, validated independently, and consumed by
@@ -83,9 +93,11 @@ any number of `Kustomizations` across sources and tenants.
   `fieldSpecs`) without growing the `Kustomization` API field by field.
 - Preserve Kustomize transformer semantics: the resolved transformers must behave
   as a `transformers:` directive applied to the **final build output**, including
-  support for custom `fieldSpecs`. This is a second Kustomize pass over the built
-  output rather than an inlining into the source `kustomization.yaml`; the
-  distinction and its consequences are documented in Build pipeline and Drawbacks.
+  support for custom `fieldSpecs`. This is a chain of Kustomize passes over the
+  built output — one per resolved `Transformer`, so that independently authored
+  sets never share an accumulator — rather than an inlining into the source
+  `kustomization.yaml`; the distinction and its consequences are documented in
+  Build pipeline and Drawbacks.
 
 ### Non-Goals
 
@@ -205,8 +217,16 @@ spec:
    `Transformer` does not exist or is not `Ready`, and if a selector matches zero
    objects. When `false`, missing references and empty selector results are
    skipped — this enables optional per-tenant or per-environment transformer packs.
-5. **Observability:** the `Kustomization` status records the resolved transformer
-   set, including whether each entry was selected explicitly or via a selector.
+5. **No-op detection:** each resolved transformer set is expected to change the
+   build output. A set whose pass leaves the output byte-identical to its input
+   (it selected nothing) is recorded in status and, when
+   `transformersPolicy.failOnNoop` is `true`, fails the reconciliation. This turns
+   the silent-miss mode — a policy set that quietly matches nothing after an
+   upstream rename — into an actionable error. Defaults to `false`, so additive
+   and optional packs that legitimately match nothing on some builds stay valid.
+6. **Observability:** the `Kustomization` status records the resolved transformer
+   set, including whether each entry was selected explicitly or via a selector,
+   and flags any set detected as a no-op.
 
 #### Build pipeline
 
@@ -218,19 +238,45 @@ The resolved transformers are applied to the fully built resource set — after
 ```text
 source artifact @ revision
   → kustomize build spec.path (components, patches, images included)
-  → apply resolved Transformer sets (in resolution order)
+  → for each resolved Transformer, in resolution order:
+        one Kustomize pass over a synthetic kustomization.yaml:
+          resources:    [output of the previous step]
+                        + [that Transformer's local-config companions]
+          transformers: [that Transformer's manifests]
+        → IgnoreLocal prunes that Transformer's companions from the pass output
   → postBuild variable substitution
   → server-side apply
 ```
 
-This is implemented as a second Kustomize pass with a synthetic
-`kustomization.yaml` that lists the build output (plus any `local-config`
-companion resources shipped with the transformer sets) under `resources:` and the
-resolved transformer manifests under `transformers:`, preserving Kustomize
-transformer semantics including custom `fieldSpecs`.
+Each resolved `Transformer` is applied in **its own Kustomize pass**, driven by a
+synthetic `kustomization.yaml`. Kustomize transformer semantics, including custom
+`fieldSpecs`, are preserved within each pass; resolution order is pass order.
 
-Because this is a distinct second pass, the resolved transformers operate on the
-fully built output of `spec.path` — after generators, name-hash finalization,
+Per-transformer passes are a design decision rather than an implementation
+detail: they are what makes independently authored transformer sets composable.
+Kustomize enforces resource identity uniqueness on the accumulator, and
+`local-config` companions occupy an accumulator slot by GVK+name even though they
+are pruned from the output. Two policy packs that both ship a companion named
+`SecurityBaseline/restricted` — a naming convention, not a coincidence — can
+therefore never be accumulated into a single resmap:
+
+```text
+may not add resource with an already registered id:
+SecurityBaseline.v1.config.example.com/restricted.[noNs]
+```
+
+Every composition model that co-locates transformer sets into one build inherits
+that failure — a single merged pass, `spec.components`, or file-level artifact
+composition — and it surfaces only at compose time, since each pack validates
+green on its own. With one pass per `Transformer` the packs never share an
+accumulator: a companion is visible only to the transformers shipped alongside
+it and is pruned again at the end of that pass, so both packs apply, with later
+passes overriding earlier ones on fields they both write. The same property makes
+ordering a per-consumer decision: two `Kustomizations` can consume the same two
+`Transformers` in opposite order without either set being duplicated.
+
+Because the transformers run in passes over the built output, they operate on the
+final result of `spec.path` — after generators, name-hash finalization,
 namespacing and the consumer's own transformers (`spec.components`,
 `spec.patches`, `spec.images`, `spec.commonMetadata`) have already been applied.
 This is the intended behavior ("apply this transformer set to the final build
@@ -238,6 +284,15 @@ output"), but it is deliberately **not** a 1:1 substitute for inlining the same
 transformers under `transformers:` in the source `kustomization.yaml`, where they
 would run before name-hash finalization and could interleave with the other
 transformers. See Drawbacks.
+
+This post-build timing is a property of the second-pass **implementation**, not
+of the design. Per-set isolation comes from materializing each set against its
+own accumulator — not from *when* the pass runs — so the two properties are
+independent: a future implementation could apply each resolved set at its
+canonical, pre-hash position in the Kustomize pipeline and remain equally
+collision-free. The `v1alpha1` contract commits only to "apply each set to the
+built output"; narrowing the divergence this way is left open as a compatible
+refinement rather than precluded by the API.
 
 Whenever a consumed `Transformer` changes (new validated revision), all
 `Kustomizations` referencing it are requeued, mirroring the existing
@@ -358,10 +413,18 @@ is to host the transformer file.
 
 #### Story 3: Security baseline propagation in bulk
 
-> As a platform security engineer, I must enforce a hardened `securityContext`
-> (drop all capabilities, no privilege escalation, read-only rootfs) on every
-> container of every workload, including sidecars injected by third-party bases I
-> cannot edit.
+> As a platform engineer, I want to propagate a hardened `securityContext` (drop
+> all capabilities, no privilege escalation, read-only rootfs) into every
+> container of the workloads these `Kustomizations` manage — including sidecars
+> injected by third-party bases I cannot edit — from a single definition, using
+> the one transformer able to deep-copy a structured value across a
+> variable-length container list.
+
+This is bulk propagation into managed manifests, not admission-time enforcement:
+workloads created outside these `Kustomizations` are untouched, and a cluster-wide
+guarantee remains the job of a validating admission policy. What the transformer
+set buys is expressing the fan-out once — with `ReplacementTransformer`'s wildcard
+`fieldPaths` — instead of copying the baseline into every overlay that needs it.
 
 The transformer set ships the baseline as a companion resource annotated with
 `config.kubernetes.io/local-config` — per Kustomize semantics it is available as
@@ -557,18 +620,43 @@ the cluster API the source of truth, which conflicts with GitOps principles. An
 additive `spec.inline` mode could be considered later for trivial cases; it is out
 of scope for the initial version.
 
-#### Share transformers via `ExternalArtifact` or OCI artifacts
+#### Compose sources with an `ArtifactGenerator`
 
 Transformer files can be distributed as OCI artifacts today, but consuming them
 still requires an overlay that references the files locally — which the load
-restrictor forbids across artifacts. A 3rd party `ExternalArtifact` controller
-could compose application manifests and transformer sets from several sources
-into a single artifact, working around the restrictor. This shifts the problem
-rather than solving it: every transformer-set variant has to be mounted at the
-same well-known path inside the composed artifact, composition logic lives
-outside Flux with reduced visibility (no per-transformer status, readiness or
-trace), and source management complexity grows with each app/transformer
-combination. Distribution is not the gap; build-time composition is.
+restrictor forbids across artifacts. An `ArtifactGenerator`
+(`source.extensions.fluxcd.io/v1beta1`, source-watcher) can copy application
+manifests and transformer files from several sources into one `ExternalArtifact`,
+working around the restrictor. Distribution is not the gap, though — build-time
+composition is, and file-level co-location is not the same operation:
+
+- **Composition is static and centrally owned.** `spec.sources` and the `copy`
+  list enumerate the inputs at generation time, in an object owned by whoever owns
+  the generator. There is no equivalent of a label selector, so a tenant cannot
+  contribute a transformer pack without a commit to a platform-owned object, and
+  every application/transformer-set combination needs its own artifact — each a
+  full copy of the application, all regenerated whenever any pack changes.
+- **Consuming still needs an overlay.** A generated artifact is a directory tree;
+  something inside it must list the transformer files under `transformers:`. For a
+  vendor-published application root that does not, that means committing a wrapper
+  kustomization per combination — the pure-transformer overlay this RFC removes,
+  relocated rather than eliminated. The `Merge` copy strategy can inject the key
+  into an existing `kustomization.yaml`, but merge replaces arrays wholesale, so it
+  silently drops any `transformers:` list the upstream later adds.
+- **Co-location breaks independently authored sets.** Everything ends up in a
+  single `kustomize build`, so two packs whose companion resources share an
+  identity fail with `may not add resource with an already registered id`, and
+  packs whose assumptions interact — a rename pack rewriting the labels a policy
+  pack selects on — resolve by file order rather than per-consumer intent, with a
+  successful build and a silently missing policy as the failure mode. The
+  `Transformer` model orders sets per consumer and surfaces that miss via
+  `failOnNoop`. See Build pipeline.
+- **No per-set lifecycle.** The composed artifact has a single revision covering
+  all inputs, with no per-transformer readiness, status or trace.
+
+The two APIs are complementary rather than competing: `ExternalArtifact` is a
+valid `Transformer.spec.sourceRef` kind, so a generated artifact can back a
+transformer set that is then composed per consumer.
 
 ## Design Details
 
@@ -626,6 +714,12 @@ type TransformersPolicy struct {
 	// matches no objects. Defaults to true.
 	// +optional
 	FailOnMissing *bool `json:"failOnMissing,omitempty"`
+
+	// FailOnNoop fails the reconciliation when a resolved transformer
+	// set produces output identical to its input (it selected nothing).
+	// Defaults to false.
+	// +optional
+	FailOnNoop *bool `json:"failOnNoop,omitempty"`
 }
 
 // KustomizationSpec additions:
@@ -671,6 +765,25 @@ resolved `Transformer` from source-controller storage at the revision recorded i
 deterministically. No new artifact storage endpoint is introduced; the existing
 source artifact distribution and digest verification are reused.
 
+### Versioning and canary rollout
+
+Because consumers follow the `Transformer` object and the `Transformer` follows
+only what its `sourceRef` resolves to, the object is the version pin. Pointing a
+`Transformer` at an immutable ref (an OCI digest or a Git tag) means a change to
+the underlying transformer files does not reach any consumer until the
+`Transformer`'s pinned ref is advanced — closing the "one edit to a shared set
+silently reconfigures the whole fleet" hazard. A bad edit that fails validation
+leaves the `Transformer` not `Ready`, and with `failOnMissing: true` consumers
+fail loudly rather than applying a broken set.
+
+Canary rollout builds on the same property. To trial a new revision of a widely
+consumed set, publish it as a second `Transformer` (e.g. `org-labels-next`)
+pinned to the new ref and move a subset of consumers — or a subset of selector
+labels — onto it. Once validated, advance the original `Transformer`'s pin (or
+relabel) and retire the canary. Every consumer records the resolved names and
+revisions in status, so the blast radius of a change is observable before and
+after it is made.
+
 ### Multi-tenancy and security
 
 - Cross-namespace explicit references are subject to the existing
@@ -707,9 +820,26 @@ The feature will be gated behind a `Transformers` feature gate on
 - `flux reconcile transformer` and `flux suspend/resume transformer` follow the
   existing command patterns.
 - `flux build kustomization` and `flux diff kustomization` resolve `Transformer`
-  references from the cluster; a `--local-transformers <dir>` flag allows offline
-  builds by mapping transformer names to local directories.
+  references from the cluster and reproduce the controller's output exactly,
+  sharing the resolution and pass logic in `fluxcd/pkg/kustomize` so the CLI and
+  the controller cannot diverge.
+- `--local-transformers <name>=<dir>` maps transformer references to local
+  directories for offline builds. It fails closed: a reference that is neither
+  resolvable from the cluster nor mapped locally is an error, never a silent skip,
+  so an offline build never omits a transformer set without saying so.
 - `flux tree` and `flux trace` are extended to surface `Transformer` dependencies.
+
+### Local build convergence
+
+Reproducing a controller build locally is a `v1alpha1` requirement, not a
+follow-up. `flux build kustomization` resolves and applies the same transformer
+set through the same `fluxcd/pkg/kustomize` code path the controller uses, so its
+output is byte-identical to what the controller applies — with the single existing
+exception of `spec.postBuild` substitutions sourced from cluster Secrets and
+ConfigMaps, which `flux build` already cannot reproduce offline. The
+`--local-transformers` mapping keeps this working with no cluster access and fails
+closed on any unmapped reference, so the offline path can never diverge by
+silently dropping a set.
 
 ### Drawbacks
 
@@ -723,16 +853,25 @@ The feature will be gated behind a `Transformers` feature gate on
 - Additional watches and fan-out (one `Transformer` to many `Kustomizations`)
   increase controller load; the implementation reuses the existing source
   index/requeue machinery.
-- Transformer application is a second Kustomize pass over the built output, not an
-  inlining into the source `kustomization.yaml`. Resolved transformers always run
-  after generators, name-hash finalization, namespacing and the consumer's own
+- Transformer application is a chain of Kustomize passes over the built output, not
+  an inlining into the source `kustomization.yaml`. Resolved transformers always
+  run after generators, name-hash finalization, namespacing and the consumer's own
   transformers, and cannot be interleaved with them. For the overwhelming majority
   of transformer kinds and `fieldSpecs` this is behaviorally indistinguishable, but
   it is not a byte-for-byte 1:1 mapping to listing the same transformers under
   `transformers:` in the original kustomization: the model optimizes for "apply
   this set to the final build output" rather than full single-pass pipeline
   equivalence. Cases that depend on running before name-hash finalization or on a
-  specific interleaving with other transformers are the known divergence.
+  specific interleaving with other transformers are the known divergence. This
+  divergence belongs to the second-pass implementation, not the API contract; see
+  Build pipeline for the pre-hash refinement that would remove it without
+  sacrificing accumulator isolation.
+- One pass per resolved `Transformer` means N krusty invocations for N consumed
+  sets, each re-parsing the intermediate resource set. This is the price of
+  accumulator isolation (see Build pipeline); it is linear in the number of
+  consumed sets, not in the size of the fleet, and transformer manifests are
+  small. Merging passes as an optimization is not safe in general, because it
+  reintroduces companion identity collisions between independently authored sets.
 
 ## Implementation History
 

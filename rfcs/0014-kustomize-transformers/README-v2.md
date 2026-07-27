@@ -4,7 +4,7 @@
 
 **Creation date:** 2026-06-12
 
-**Last update:** 2026-06-12
+**Last update:** 2026-07-27
 
 > [!NOTE]
 > This is an **alternative** draft to the primary proposal in
@@ -73,10 +73,11 @@ fails exactly the way canonical `kustomize build` fails (see
 - Reuse the existing source/build/validation/status/fan-out machinery; add no new
   kind and no new controller.
 - Preserve Kustomize transformer semantics: consumed transformers behave as a
-  `transformers:` directive applied to the **final build output**. This is a
-  second Kustomize pass over the built output, not an inlining into the source
-  `kustomization.yaml`; the distinction and its consequences are documented in
-  [Build pipeline](#build-pipeline) and [Drawbacks](#drawbacks).
+  `transformers:` directive applied to the **final build output**. This is a chain
+  of Kustomize passes over the built output — one per group of consumed units, so
+  that independently authored packs never share an accumulator — not an inlining
+  into the source `kustomization.yaml`; the distinction and its consequences are
+  documented in [Build pipeline](#build-pipeline) and [Drawbacks](#drawbacks).
 
 ### Non-Goals
 
@@ -129,8 +130,11 @@ spec:
     name: storefront
   path: ./deploy
   transformers:
-    - name: staging-name-prefix      # a buildOnly Kustomization
-    - name: security-baseline-data   # a buildOnly Kustomization (resource unit)
+    # group 1: a transformer unit on its own
+    - name: staging-name-prefix
+    # group 2 opens with a resource unit; the selector below contributes the
+    # transformer unit that consumes its companion
+    - name: security-baseline-data
       namespace: flux-system
   transformerSelectors:
     - matchLabels:
@@ -156,12 +160,24 @@ data live in *separate* `buildOnly` Kustomizations and are composed at the
 consumer. This is the strict-separation refinement of v1's "bundled companion"
 model, and it is what makes content-based routing unambiguous.
 
+The consequence is that a pack's data unit and transformer unit are paired
+**positionally**: they must be adjacent in the resolved list so they fall into the
+same pass (see [Resolution semantics](#resolution-semantics)). Explicit references
+give that ordering directly; selector-resolved matches are name-sorted, so a
+pack's units must be named to sort adjacently (e.g. a shared prefix, as in
+[Story 2](#story-2-security-baseline-as-two-composed-units-the-showcase-for-this-draft)).
+v1 avoids the question entirely by bundling companions inside one `Transformer`;
+this is a real concession of v2, listed under [Drawbacks](#drawbacks).
+
 #### Resolution semantics
 
-1. **Order:** explicit `transformers` are applied in list order, followed by the
-   matches of each entry in `transformerSelectors` (matches within a selector
-   sorted by name for determinism). Resource units are accumulated before the
-   transformer pass regardless of list position.
+1. **Order and grouping:** explicit `transformers` are resolved in list order,
+   followed by the matches of each entry in `transformerSelectors` (matches within
+   a selector sorted by name for determinism). The resolved list is then
+   partitioned into consecutive groups — each a run of resource units followed by
+   a run of transformer units — and each group is applied in one Kustomize pass
+   (see [Build pipeline](#build-pipeline)). A resource unit is therefore visible
+   only to the transformer units that follow it in the same group.
 2. **Dedup:** a unit matched both by reference and by selector (or by multiple
    selectors) is materialized once.
 3. **Selector scope:** selectors match only `Kustomization` objects in the
@@ -173,9 +189,14 @@ model, and it is what makes content-based routing unambiguous.
    selector results are skipped.
 5. **Cycle detection:** a `buildOnly` Kustomization may itself consume other
    `buildOnly` Kustomizations; the controller rejects reference cycles.
-6. **Observability:** the consumer status records the resolved input set, each
-   entry's pinned revision, and whether it was selected explicitly or via a
-   selector.
+6. **No-op detection:** a resolved group whose pass leaves the output identical to
+   its input (it selected nothing) is recorded in status and, when
+   `transformersPolicy.failOnNoop` is `true`, fails the reconciliation — turning a
+   silent miss (e.g. a policy group whose target labels were renamed upstream)
+   into an actionable error. Defaults to `false`.
+7. **Observability:** the consumer status records the resolved input set, each
+   entry's pinned revision, whether it was selected explicitly or via a selector,
+   and any group detected as a no-op.
 
 ### Build pipeline
 
@@ -190,10 +211,12 @@ consumer source @ revision
   → resolve referenced buildOnly Kustomizations (deterministic order)
       → resource units: build from pinned revision with IncludeLocalConfigs
       → transformer units: build from pinned revision, collect manifests
-  → second Kustomize pass over a synthetic kustomization.yaml:
-        resources:    [main build output] + [resource-unit outputs, incl. local-config]
-        transformers: [transformer-unit manifests]
-  → IgnoreLocal prunes local-config companions from the output
+  → partition the resolved list into groups: a run of resource units followed by
+    a run of transformer units
+  → for each group, in order, one Kustomize pass over a synthetic kustomization.yaml:
+        resources:    [output of the previous step] + [the group's resource units]
+        transformers: [the group's transformer-unit manifests]
+      → IgnoreLocal prunes that group's local-config companions from the pass output
   → postBuild variable substitution
   → server-side apply
 ```
@@ -206,17 +229,43 @@ recording every consumed revision in the consumer's status.
 
 Resource units are built with the resource factory's `IncludeLocalConfigs` option
 enabled, so `local-config` companion resources survive materialization and are
-available as replacement sources in the synthetic pass; they are pruned from the
-consumer's final output by the normal local-config handling.
+available as replacement sources in the pass that consumes them; they are pruned
+from that pass's output by the normal local-config handling.
 
-Because this is a distinct second pass, the resolved transformers operate on the
-fully built output — after generators, name-hash finalization, namespacing and
-the consumer's own transformers have already been applied. This is the intended
-behavior ("apply this set to the final build output"), but it is deliberately
-**not** a 1:1 substitute for inlining the same transformers under `transformers:`
-in the source `kustomization.yaml`, where they would run before name-hash
-finalization and could interleave with the other transformers. See
-[Drawbacks](#drawbacks).
+#### Why one pass per group, not one merged pass
+
+Merging every resolved unit into a single synthetic pass is simpler but breaks the
+composition it is meant to enable. Kustomize enforces resource identity uniqueness
+on the accumulator, and `local-config` companions occupy a slot by GVK+name even
+though they are pruned from the output. Two policy packs that both ship a
+companion named `SecurityBaseline/restricted` — a naming convention, not a
+coincidence — cannot land in one resmap:
+
+```text
+may not add resource with an already registered id:
+SecurityBaseline.v1.config.example.com/restricted.[noNs]
+```
+
+That failure is shared by every model that co-locates sets into one build (a
+merged pass, `spec.components`, or artifact-level file composition), and it
+surfaces only at compose time, since each pack validates green on its own.
+Grouping keeps each companion visible only to the transformer units in its own
+group, so both packs apply, with later groups overriding earlier ones on fields
+they both write.
+
+Because the transformers run in passes over the built output, they operate on the
+final result of the consumer's own build — after generators, name-hash
+finalization, namespacing and the consumer's own transformers have already been
+applied. This is the intended behavior ("apply this set to the final build
+output"), but it is deliberately **not** a 1:1 substitute for inlining the same
+transformers under `transformers:` in the source `kustomization.yaml`, where they
+would run before name-hash finalization and could interleave with the other
+transformers. See [Drawbacks](#drawbacks).
+
+As in v1, this timing is a property of the pass implementation, not the design:
+group isolation comes from materializing each group against its own accumulator,
+not from when the pass runs, so a future implementation could apply each group at
+its canonical pre-hash position and stay equally collision-free.
 
 ### Validation inherited from Kustomize
 
@@ -273,7 +322,9 @@ reconciliation, via the existing source-change fan-out.
 The security baseline is split into two homogeneous `buildOnly` Kustomizations: a
 **resource unit** carrying the `local-config` companion, and a **transformer unit**
 carrying the `ReplacementTransformer`. They may live in different repositories and
-even different sources.
+even different sources. As in v1 Story 3, this is bulk propagation into the
+manifests these `Kustomizations` manage, not admission-time enforcement of the
+whole cluster; the value is expressing the structured fan-out once.
 
 ```yaml
 # Resource unit — sourced from fleet-config (Git)
@@ -362,10 +413,14 @@ spec:
         policy.example.com/security-baseline: "true"
 ```
 
-At build time the consumer accumulates the `SecurityBaseline` (resource unit) into
-its resmap and applies the `ReplacementTransformer` (transformer unit); the
-replacement deep-copies the `securityContext` into every container of every
-`Deployment`/`StatefulSet`; the `local-config` source is pruned from the output.
+Both units match the same selector and sort adjacently (`…-data` before
+`…-xform`), so they form one group and are applied in a single pass: the consumer
+accumulates the `SecurityBaseline` (resource unit) into that pass's resmap and
+applies the `ReplacementTransformer` (transformer unit); the replacement
+deep-copies the `securityContext` into every container of every
+`Deployment`/`StatefulSet`; the `local-config` source is pruned from the pass
+output. A second pack selected by the same label forms its own group, so its
+companion may reuse the `restricted` name without colliding.
 Cross-source composition (Git companion + OCI transformer) happens at the
 consumer, with each unit independently versioned and observable.
 
@@ -399,11 +454,27 @@ minimal new surface**.
 The decisive trade-off between v1 and v2 is therefore *first-class concept vs.
 minimal surface*:
 
-- v1: a `Transformer` is obviously a transformer set; great discoverability; new
-  kind + reconciler to build and maintain.
+- v1: a `Transformer` is obviously a transformer set; great discoverability;
+  companions bundled with their transformers, so pass scoping needs no ordering
+  rules; new kind + reconciler to build and maintain.
 - v2: a transformer set is "a `Kustomization` with `buildOnly: true`"; almost no
   new surface and free canonical validation; but the concept is less
-  self-documenting and overloads `Kustomization` with a dual role.
+  self-documenting, overloads `Kustomization` with a dual role, and the
+  homogeneity split makes companion scoping positional.
+
+#### Compose sources with an `ArtifactGenerator`
+
+An `ArtifactGenerator` (`source.extensions.fluxcd.io/v1beta1`, source-watcher) can
+copy application manifests and transformer files from several sources into one
+`ExternalArtifact`. It solves distribution across source boundaries, not build-time
+composition: the input set is a static enumeration in a centrally owned object with
+no selector equivalent, consuming it still requires a committed wrapper
+kustomization per combination, and co-locating independently authored packs in one
+build hits the companion identity collision described under
+[Build pipeline](#why-one-pass-per-group-not-one-merged-pass). See
+[`README.md`](./README.md#compose-sources-with-an-artifactgenerator) for the full
+treatment. The two are complementary: an `ExternalArtifact` is a valid `sourceRef`
+for a `buildOnly` Kustomization.
 
 #### Standalone independent controller
 
@@ -474,6 +545,11 @@ type TransformersPolicy struct {
 	// objects. Defaults to true.
 	// +optional
 	FailOnMissing *bool `json:"failOnMissing,omitempty"`
+
+	// FailOnNoop fails reconciliation when a resolved group produces output
+	// identical to its input (it selected nothing). Defaults to false.
+	// +optional
+	FailOnNoop *bool `json:"failOnNoop,omitempty"`
 }
 ```
 
@@ -493,6 +569,18 @@ No new artifact storage endpoint is introduced; existing source artifact
 distribution and digest verification are reused. The full resolved set (names,
 namespaces, revisions, digests) is recorded in the consumer status, so a consumer
 build remains reproducible even though it depends on inputs beyond its own source.
+
+Versioning and canary rollout work as in v1 ([README.md](./README.md#versioning-and-canary-rollout)):
+a `buildOnly` Kustomization pinned to an immutable ref is the version pin, a bad
+edit that fails its own build leaves it not `Ready` so `failOnMissing` consumers
+fail loudly, and a canary is a second `buildOnly` object on the new ref that a
+subset of consumers or selector labels move onto.
+
+`flux build kustomization` reproduces a consumer build offline through the same
+`fluxcd/pkg/kustomize` code path the controller uses, mapping consumed units to
+local directories and failing closed on any unmapped reference — the same local
+build convergence guarantee described for v1
+([README.md](./README.md#local-build-convergence)).
 
 ### How this feature is enabled / disabled
 
@@ -537,11 +625,21 @@ build remains reproducible even though it depends on inputs beyond its own sourc
 - **Reduced discoverability.** A transformer set is no longer a self-documenting
   kind; it is a `Kustomization` with a flag. This is the core concession relative
   to v1.
-- **Second-pass deviation.** As in v1, consumed transformers run after the
+- **Extra-pass deviation.** As in v1, consumed transformers run after the
   consumer's full build and cannot interleave with the consumer's own
   transformers or run before name-hash finalization. Indistinguishable for the
   vast majority of transformer kinds; the divergence is real only for pre-hash or
-  interleaving-dependent cases.
+  interleaving-dependent cases, and belongs to the pass implementation rather than
+  the API contract (see Build pipeline for the pre-hash refinement).
+- **Positional pairing of data and transformer units.** Because homogeneity splits
+  a pack into two objects, keeping a companion in scope for its own transformers
+  depends on the two units landing in the same group — explicit ordering, or names
+  that sort adjacently under a selector. v1's bundled companions make the scoping
+  intrinsic. A mis-ordered pair fails loudly with Kustomize's "nothing selected
+  by …", but it is an avoidable footgun that v1 does not have.
+- **Pass count.** One pass per group means N krusty invocations for N groups. Linear
+  in consumed units, not in fleet size, and merging groups is not a safe
+  optimization because it reintroduces companion identity collisions.
 - **Reproducibility depends on inputs.** A consumer build is no longer reproducible
   from its own source artifact alone; mitigated by recording all consumed
   revisions/digests in status.
