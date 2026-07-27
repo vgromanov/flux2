@@ -1,0 +1,16 @@
+apiVersion: builtin
+kind: ReplacementTransformer
+metadata:
+  name: security-baseline-b
+replacements:
+  - source:
+      kind: SecurityBaseline
+      name: restricted
+      fieldPath: securityContext
+    targets:
+      - select:
+          kind: Deployment
+        fieldPaths:
+          - spec.template.spec.containers.*.securityContext
+        options:
+          create: true

@@ -1,0 +1,5 @@
+# Transform-only pack (e.g. ReplacementTransformer harden). Must run after
+# every resource-emitting component — hence "last in the list".
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources: []

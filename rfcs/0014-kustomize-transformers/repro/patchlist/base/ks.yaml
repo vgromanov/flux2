@@ -1,0 +1,15 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: storefront
+  namespace: apps
+spec:
+  interval: 10m
+  prune: true
+  sourceRef:
+    kind: OCIRepository
+    name: storefront
+  path: ./deploy
+  components:
+    - ../components/app-defaults
+    - ../components/harden        # transform-only: must stay last

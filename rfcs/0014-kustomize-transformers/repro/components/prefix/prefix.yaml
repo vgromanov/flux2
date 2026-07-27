@@ -1,0 +1,14 @@
+apiVersion: builtin
+kind: PrefixSuffixTransformer
+metadata:
+  name: staging-prefix
+prefix: stage1-
+fieldSpecs:
+  - kind: Deployment
+    path: metadata/name
+  - kind: Deployment
+    path: metadata/labels/app
+  - kind: Deployment
+    path: spec/selector/matchLabels/app
+  - kind: Deployment
+    path: spec/template/metadata/labels/app

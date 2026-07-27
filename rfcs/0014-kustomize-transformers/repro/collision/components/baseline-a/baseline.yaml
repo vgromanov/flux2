@@ -1,0 +1,13 @@
+# Pack A — authored/validated in isolation (e.g. fleet-config Git)
+apiVersion: config.example.com/v1
+kind: SecurityBaseline
+metadata:
+  name: restricted
+  annotations:
+    config.kubernetes.io/local-config: "true"
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

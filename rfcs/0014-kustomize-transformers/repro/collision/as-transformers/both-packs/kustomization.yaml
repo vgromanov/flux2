@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - app
+  - pack-a/baseline.yaml
+  - pack-b/baseline.yaml
+transformers:
+  - pack-a/replacement.yaml
+  - pack-b/replacement.yaml

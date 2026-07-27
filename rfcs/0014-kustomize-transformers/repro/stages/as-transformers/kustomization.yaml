@@ -1,0 +1,18 @@
+# The same pack attached under `transformers:` instead of `components:`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../app
+  - pack/baseline.yaml
+transformers:
+  - pack/harden.yaml
+patches:
+  - target:
+      kind: Deployment
+      name: storefront
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/-
+        value:
+          name: sidecar
+          image: ghcr.io/example/mesh-proxy:0.9.1

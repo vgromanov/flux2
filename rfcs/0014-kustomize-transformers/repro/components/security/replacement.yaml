@@ -1,0 +1,19 @@
+apiVersion: builtin
+kind: ReplacementTransformer
+metadata:
+  name: security-baseline
+replacements:
+  - source:
+      kind: SecurityBaseline
+      name: restricted
+      fieldPath: securityContext
+    targets:
+      # Order-sensitive: prefix pack also rewrites label app=storefront.
+      # If prefix runs first, this selector matches nothing — silently.
+      - select:
+          kind: Deployment
+          labelSelector: app=storefront
+        fieldPaths:
+          - spec.template.spec.containers.*.securityContext
+        options:
+          create: true

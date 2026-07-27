@@ -1,0 +1,12 @@
+# Pack B — different team/repo, same conventional companion name
+apiVersion: config.example.com/v1
+kind: SecurityBaseline
+metadata:
+  name: restricted
+  annotations:
+    config.kubernetes.io/local-config: "true"
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  # slightly different on purpose — still same identity
+  runAsUser: 65534

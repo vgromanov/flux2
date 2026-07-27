@@ -1,0 +1,22 @@
+# Correct (non-modular): restate the entire list via strategic merge.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Kustomization
+      name: storefront
+    patch: |-
+      apiVersion: kustomize.toolkit.fluxcd.io/v1
+      kind: Kustomization
+      metadata:
+        name: storefront
+        namespace: apps
+      spec:
+        components:
+          - ../components/app-defaults
+          - ../components/monitoring
+          - ../components/redis-cache
+          - ../components/logging-labels
+          - ../components/harden

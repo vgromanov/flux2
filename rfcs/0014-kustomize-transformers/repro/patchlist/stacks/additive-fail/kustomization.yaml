@@ -1,0 +1,19 @@
+# Fail: append-only adds land after the transform tail.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Kustomization
+      name: storefront
+    patch: |-
+      - op: add
+        path: /spec/components/-
+        value: ../components/monitoring
+      - op: add
+        path: /spec/components/-
+        value: ../components/redis-cache
+      - op: add
+        path: /spec/components/-
+        value: ../components/logging-labels

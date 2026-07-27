@@ -1,0 +1,24 @@
+# Correct (fragile): insert each resource pack before harden by index.
+# Patches apply in order; indices account for prior inserts.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Kustomization
+      name: storefront
+    patch: |-
+      # base: [app-defaults, harden]
+      - op: add
+        path: /spec/components/1
+        value: ../components/monitoring
+      # → [app-defaults, monitoring, harden]
+      - op: add
+        path: /spec/components/2
+        value: ../components/redis-cache
+      # → [app-defaults, monitoring, redis-cache, harden]
+      - op: add
+        path: /spec/components/3
+        value: ../components/logging-labels
+      # → [app-defaults, monitoring, redis-cache, logging-labels, harden]
